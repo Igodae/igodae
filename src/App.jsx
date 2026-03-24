@@ -827,6 +827,96 @@ function AdminView({ logs, onBack }) {
 }
 
 // ─── 카메라 뷰 ────────────────────────────────────────────────────────────────
+// ─── 온보딩 슬라이드 ─────────────────────────────────────────────────────────
+function OnboardingSlides({ onComplete }) {
+  const [current, setCurrent] = useState(0)
+  const slides = [
+    {
+      emoji: '📸',
+      title: '약을 찍어주세요',
+      desc: '약 봉투 안 알약을 카메라로 찍거나
+갤러리에서 사진을 올려주세요',
+      tips: ['알약이 잘 보이게 가까이 찍어주세요', '각인 문자가 보이면 더 정확해요', '여러 알약이 있으면 한번에 찍어도 돼요'],
+      color: '#0192F5',
+    },
+    {
+      emoji: '🔍',
+      title: '분석 결과 확인',
+      desc: 'AI와 식약처 DB가 함께
+각 알약의 성분과 효능을 알려드려요',
+      tips: ['알약마다 성분과 효능을 따로 확인할 수 있어요', '식약처 공식 정보를 우선으로 보여드려요', '신뢰도 점수로 결과의 정확성을 알 수 있어요'],
+      color: '#16A34A',
+    },
+    {
+      emoji: '💬',
+      title: 'AI 약사에게 물어보세요',
+      desc: '분석 결과를 바탕으로
+궁금한 점을 바로 물어볼 수 있어요',
+      tips: ['식전/식후 복용 여부', '다른 약과 함께 먹어도 되는지', '부작용이 있는지'],
+      color: '#7C3AED',
+    },
+  ]
+
+  const next = () => {
+    if (current < slides.length - 1) setCurrent(current + 1)
+    else onComplete()
+  }
+
+  const s = slides[current]
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: '#fff', zIndex: 100, display: 'flex', flexDirection: 'column', maxWidth: 480, margin: '0 auto' }}>
+      {/* 스킵 버튼 */}
+      <div style={{ padding: '16px 20px', display: 'flex', justifyContent: 'flex-end' }}>
+        <button onClick={onComplete} style={{ fontSize: 13, color: '#AAA', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          건너뛰기
+        </button>
+      </div>
+
+      {/* 메인 컨텐츠 */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '0 32px', gap: 24 }}>
+        {/* 이모지 */}
+        <div style={{ width: 100, height: 100, borderRadius: '50%', background: `${s.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 52 }}>
+          {s.emoji}
+        </div>
+
+        {/* 제목 */}
+        <div style={{ textAlign: 'center' }}>
+          <h2 style={{ fontSize: 24, fontWeight: 700, color: '#111', letterSpacing: '-0.5px', marginBottom: 10 }}>{s.title}</h2>
+          <p style={{ fontSize: 15, color: '#666', lineHeight: 1.7, whiteSpace: 'pre-line' }}>{s.desc}</p>
+        </div>
+
+        {/* 팁 리스트 */}
+        <div style={{ alignSelf: 'stretch', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {s.tips.map((tip, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, background: `${s.color}08`, borderRadius: 14, padding: '12px 16px', border: `1px solid ${s.color}20` }}>
+              <div style={{ width: 24, height: 24, borderRadius: '50%', background: s.color, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <span style={{ color: '#fff', fontSize: 12, fontWeight: 700 }}>{i + 1}</span>
+              </div>
+              <span style={{ fontSize: 13, color: '#444', lineHeight: 1.5 }}>{tip}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 하단 */}
+      <div style={{ padding: '20px 24px 40px', display: 'flex', flexDirection: 'column', gap: 16, alignItems: 'center' }}>
+        {/* 인디케이터 */}
+        <div style={{ display: 'flex', gap: 6 }}>
+          {slides.map((_, i) => (
+            <div key={i} onClick={() => setCurrent(i)} style={{ width: i === current ? 20 : 6, height: 6, borderRadius: 3, background: i === current ? s.color : '#DDD', cursor: 'pointer', transition: 'all 0.3s' }} />
+          ))}
+        </div>
+
+        {/* 다음 버튼 */}
+        <button onClick={next} style={{ width: '100%', padding: '17px 0', borderRadius: 16, background: `linear-gradient(135deg, ${s.color}, ${s.color}CC)`, color: '#fff', border: 'none', fontSize: 16, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', letterSpacing: '-0.2px' }}>
+          {current < slides.length - 1 ? '다음' : '시작하기 →'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function CameraView({ onCapture, onCancel }) {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
@@ -1073,6 +1163,7 @@ export default function App() {
   const [symptom, setSymptom] = useState('')
   const [showAdminPin, setShowAdminPin] = useState(false)
   const [adminPin, setAdminPin] = useState('')
+  const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('igodae_onboarding_done'))
   const [logoTapCount, setLogoTapCount] = useState(0)
   const logoTapTimer = useRef(null)
 
@@ -1209,6 +1300,11 @@ export default function App() {
     await runAnalysis(base64, file.type || 'image/jpeg')
   }, [processImage, runAnalysis])
 
+  const handleOnboardingComplete = () => {
+    localStorage.setItem('igodae_onboarding_done', 'true')
+    setShowOnboarding(false)
+  }
+
   const handleLogoTap = () => {
     const next = logoTapCount + 1
     setLogoTapCount(next)
@@ -1229,6 +1325,7 @@ export default function App() {
     setView('home')
   }
 
+  if (showOnboarding) return <OnboardingSlides onComplete={handleOnboardingComplete} />
   if (view === 'admin') return <AdminView logs={analysisLogs} onBack={() => setView('home')} />
   if (view === 'camera') return <CameraView onCapture={handleCameraCapture} onCancel={() => setView('home')} />
   if (view === 'chat' && analysisResult) return <ChatView result={analysisResult} mfdsInfo={mfdsInfo} userConditions={userConditions} onBack={() => setView('home')} />
