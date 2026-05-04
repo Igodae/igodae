@@ -304,30 +304,43 @@ async function checkDurDuplicate(drugNames) {
 async function runDurCheck(pillResults, userProfile = {}) {
   const drugNames = pillResults.map(p => p.drugNameForSearch || p.summary).filter(Boolean)
   if (drugNames.length === 0) return []
-  const checks = [checkDurCombination(drugNames)]
+  const checks = []
+  // 2개 이상: 병용 금기 + 효능군 중복 체크
+  if (drugNames.length >= 2) {
+    checks.push(checkDurCombination(drugNames))
+    checks.push(checkDurDuplicate(drugNames))
+  }
+  // 개인 조건은 약 1개도 체크
   if (userProfile.isPregnant) checks.push(checkDurPregnancy(drugNames))
   if (userProfile.isElderly)  checks.push(checkDurElderly(drugNames))
-  if (drugNames.length >= 2)  checks.push(checkDurDuplicate(drugNames))
+  if (checks.length === 0) return []
   const results = await Promise.all(checks)
   return results.flat()
 }
 
-// ─── 알약 종합 분석 ───────────────────────────────────────────────────────────
+// ─── 알약 종합 분석 (병용 안전성 포함) ─────────────────────────────────────────
 async function analyzePillsCombined(pillResults, symptom) {
   if (!GROQ_API_KEY || pillResults.length === 0) return null
   try {
-    const pillSummary = pillResults.map((p, i) => `${i+1}. ${p.summary} - ${p.description}`).join('\n')
+    const pillSummary = pillResults.map((p, i) =>
+      `${i+1}. 약품명: ${p.summary} | 성분: ${p.activeIngredients?.join(', ') || '알수없음'} | 효능: ${p.description}`
+    ).join('\n')
+
+    const interactionBlock = pillResults.length >= 2
+      ? `\n\n### 병용 안전성 분석 (필수)\n다음을 반드시 분석하세요:\n1. 위 약들 사이에 병용 금기 또는 주의가 필요한 성분 조합이 있는가?\n2. 동일 계열(해열제+해열제 등) 또는 동일 성분 중복 복용 위험이 있는가?\n3. 심각한 상호작용(간독성, 출혈 위험, 혈압 변화 등)이 예상되는가?`
+      : `\n\n### 성분 주의 분석\n이 약 안에 타 약물과 중복 복용 시 위험한 성분(예: 아세트아미노펜, NSAIDs)이 있는지 확인하세요.`
+
     const data = await safeFetchGroq({
       model: GROQ_MODEL,
       messages: [{
         role: 'system',
-        content: '당신은 친절한 AI 약사입니다. 쉽고 짧게 설명하세요. 전문용어 금지.'
+        content: '당신은 약물 상호작용 전문 AI 약사입니다. 병용 금기와 성분 중복에 대해 반드시 명확히 경고하세요. 쉬운 말로 설명하세요.'
       }, {
         role: 'user',
-        content: `다음 약들을 분석해주세요:\n${pillSummary}\n\n사용자 증상: ${symptom || '없음'}\n\n아래 JSON만 반환하세요 (마크다운 금지):\n{\n  "combinedUse": "이 약들을 함께 먹는 이유 1-2문장 (쉬운 말로)",\n  "matchScore": "증상과 일치도 (높음/보통/낮음/알수없음)",\n  "matchReason": "증상과 맞는지 이유 1문장",\n  "recommendation": "추천합니다 | 주의가 필요해요 | 확인이 필요해요",\n  "recommendCode": "safe | caution | danger",\n  "oneLineSummary": "20자 이내 핵심 한줄 요약"\n}`
+        content: `다음 약들을 분석해주세요:\n${pillSummary}\n\n사용자 증상: ${symptom || '없음'}${interactionBlock}\n\n아래 JSON만 반환하세요 (마크다운 금지):\n{\n  "combinedUse": "이 약들을 함께 먹는 이유 또는 각 용도 1-2문장",\n  "matchScore": "증상과 일치도 (높음/보통/낮음/알수없음)",\n  "matchReason": "증상과 맞는지 이유 1문장",\n  "recommendation": "추천합니다 | 주의가 필요해요 | 확인이 필요해요",\n  "recommendCode": "safe | caution | danger",\n  "oneLineSummary": "20자 이내 핵심 한줄 요약",\n  "drugInteractions": [\n    {\n      "level": "danger | caution | info",\n      "drugs": ["약A이름", "약B이름"],\n      "reason": "위험 이유 (예: 아세트아미노펜 중복 → 간 손상 위험)",\n      "advice": "사용자 권고 행동 1문장"\n    }\n  ]\n}\n\n상호작용이 없으면 drugInteractions는 빈 배열 []로 반환하세요.`
       }],
-      temperature: 0.3,
-      max_tokens: 300,
+      temperature: 0.2,
+      max_tokens: 600,
     })
     const raw = data.choices?.[0]?.message?.content || '{}'
     return JSON.parse(raw.replace(/```json|```/g, '').trim())
@@ -340,18 +353,22 @@ async function analyzePillsCombined(pillResults, symptom) {
 // ─── 알약 1개 전체 분석 ───────────────────────────────────────────────────────
 async function analyzeSinglePill(pillFeature, symptomHint) {
   let pillData = null
+  let matchSource = 'none'
 
   // 1단계: Vision이 약 이름 읽었으면 이름으로 먼저 검색
   if (pillFeature.drugName && pillFeature.drugName.trim().length > 0) {
     pillData = await fetchPillByName(pillFeature.drugName.trim())
+    if (pillData) matchSource = 'name'
     if (!pillData && pillFeature.imprint && pillFeature.imprint.trim().length > 0) {
       pillData = await fetchPillByName(pillFeature.imprint.trim())
+      if (pillData) matchSource = 'imprint'
     }
   }
 
   // 2단계: 각인 단독 검색
   if (!pillData && pillFeature.imprint && pillFeature.imprint.trim().length > 0) {
     pillData = await fetchPillByName(pillFeature.imprint.trim())
+    if (pillData) matchSource = 'imprint'
   }
 
   // 3단계: 색상/모양으로 fallback
@@ -362,6 +379,7 @@ async function analyzeSinglePill(pillFeature, symptomHint) {
       imprint: pillFeature.imprint,
       form: pillFeature.form,
     })
+    if (pillData) matchSource = 'feature'
   }
 
   // 4단계: 약품명으로 개요 + 제품허가 병렬 조회
@@ -387,13 +405,15 @@ async function analyzeSinglePill(pillFeature, symptomHint) {
       statusText: '복용 전 확인하세요',
       summary: pillData.itemName || pillFeature.drugName || `${pillFeature.color} ${pillFeature.shape} 알약`,
       drugNameForSearch: pillData.itemName,
-      description: efcySummary || `${pillFeature.color}색 ${pillFeature.shape} 알약이에요.`,
+      description: efcySummary || '',
+      visualDescription: `${pillFeature.color}색 ${pillFeature.shape} 알약이에요.`,
       warnings: atpnSummary || '복용 전 약사에게 확인하세요.',
       dosageGuide: useSummary || '-',
       interactions: drugInfo?.intrcQesitm ? [drugInfo.intrcQesitm.slice(0, 60)] : [],
       activeIngredients: permitInfo?.ingrName ? [permitInfo.ingrName] : pillData.itemName ? [pillData.itemName] : [],
       drugType:      etcOtc,
-      confidence:    0.9,
+      confidence:    calculateMatchConfidence({ pillFeature, matchSource, drugInfo, permitInfo }),
+      matchSource,
       pillColor:     pillFeature.color,
       pillShape:     pillFeature.shape,
       pillImprint:   pillFeature.imprint,
@@ -413,13 +433,15 @@ async function analyzeSinglePill(pillFeature, symptomHint) {
     statusCode:  'caution',
     statusText:  '식약처 DB 미등록',
     summary:     pillFeature.drugName || `${pillFeature.color} ${pillFeature.shape} 알약`,
-    description: `${pillFeature.color}색 ${pillFeature.shape} 알약이에요. ${pillFeature.imprint ? `각인: ${pillFeature.imprint}` : '각인 없음'}`,
+    description: '',
+    visualDescription: `${pillFeature.color}색 ${pillFeature.shape} 알약이에요. ${pillFeature.imprint ? `각인: ${pillFeature.imprint}` : '각인 없음'}`,
     warnings:    '식약처 DB에서 찾을 수 없어요. 처방한 의사/약사에게 확인하세요.',
     dosageGuide: '-',
     interactions: [],
     activeIngredients: [],
     drugType:    '-',
     confidence:  0.2,
+    matchSource: 'none',
     pillColor:   pillFeature.color,
     pillShape:   pillFeature.shape,
     pillImprint: pillFeature.imprint,
@@ -476,6 +498,7 @@ JSON만 반환 (마크다운/설명 절대 금지):
       "form": "제형",
       "imprint": "각인 문자 전체 (없으면 빈 문자열)",
       "size": "크기 (소/중/대)",
+      "confidence": 0.0부터 1.0까지의 이미지 식별 확신도,
       "description": "외형 + 추론 근거 1문장 (예: 하양 원형 정제, 각인 TYLENOL 500으로 타이레놀로 추정)"
     }
   ],
@@ -492,22 +515,23 @@ const buildChatSystemPrompt = (analysisResult, mfdsInfo, userConditions) => {
   const drugName = analysisResult?.summary || '미분석'
 
   const highConfidencePrompt = `
-당신은 식약처 공공 데이터를 기반으로 의약품 정보를 매칭해주는 '의약품 정보 분석 전문가'입니다.
-모든 판단의 근거는 식약처 공식 허가 데이터에 기반합니다.
+당신은 식약처 공공 데이터를 기반으로 의약품 정보를 설명하는 '의약품 정보 분석 전문가'입니다.
+AI는 약물의 종류를 식별할 뿐 복용, 처방, 치료 적합성 판단을 하지 않습니다.
+모든 설명의 근거는 식약처 공식 허가 데이터입니다.
 
 [응답 원칙]
-1. "약사 상담 필요" 같은 유보적 표현을 쓰지 않습니다. 식약처에 등록된 정확한 용도와 효능을 즉시 답변합니다.
-2. 사용자가 "이 약이 [질환명] 약이 맞나요?" 라고 물으면 "식약처 허가 기준: [질환명] 치료 및 완화용"이라고 명확히 답합니다.
-3. 성분을 나열할 때 각 성분이 신체에서 어떤 작용(예: 기침 억제, 염증 완화)을 하는지 구체적으로 설명합니다.
+1. "먹어도 된다/먹으면 안 된다/처방이 맞다" 같은 복용 판단을 하지 않습니다.
+2. 사용자가 "이 약이 [질환명] 약이 맞나요?" 라고 물으면 식약처 허가 데이터상 해당 질환 또는 증상 치료 목적으로 승인된 정보가 있는지 여부만 답합니다.
+3. 성분, 효능, 용법, 주의사항은 식약처 데이터에 있는 내용만 근거로 설명합니다.
 4. 답변은 아래 템플릿 구조로 출력합니다:
 
 [식약처 데이터 분석 결과]
 의약품 명칭: {약 이름}
-공식 허가 용도: 식약처에 '{효능군} 증상 완화' 효능으로 등록된 의약품입니다.
+공식 허가 용도: 식약처 데이터 기준 {승인된 효능/효과}
 주요 작용:
   • [성분 A]: [신체 작용 설명]
   • [성분 B]: [신체 작용 설명]
-현재 상태: 해당 증상에 대한 식약처의 공식적인 사용 승인 정보와 일치합니다.
+판단 범위: AI 복용 판단이 아니라 식약처 데이터 대조 결과입니다.
 
 현재 분석된 약품: ${drugName}
 사용자 기저질환: ${userConditions || '없음'}
@@ -520,9 +544,9 @@ ${mfdsInfo ? `\n식품의약품안전처 공식 정보:\n- 효능: ${mfdsInfo.ef
 
 [응답 원칙]
 1. 모든 답변에 "식약처 데이터베이스와 ${pct}% 일치하는 의약품 정보"임을 명시합니다.
-2. 정보를 제공할 때 "데이터 매칭 결과"임을 강조하여 최종 판단은 사용자에게 있음을 안내합니다.
+2. 정보를 제공할 때 "데이터 매칭 결과"임을 강조하고, 복용 판단은 하지 않습니다.
 3. 답변 말미에 항상 아래 주의 문구를 포함합니다:
-   "[주의] 분석 일치율이 80% 미만인 경우, 사진 상태에 따라 정보 왜곡이 발생할 수 있습니다. 본 앱은 데이터 대조 결과만을 제공하며, 최종 복용 결정에 따른 책임은 전적으로 사용자에게 있습니다. 실제 약품 외형을 반드시 대조한 후 복용하십시오."
+   "[주의] 분석 일치율이 70% 미만인 경우, 사진 상태에 따라 정보 왜곡이 발생할 수 있습니다. 본 앱은 AI의 복용 판단이 아니라 식약처 데이터 대조 결과만 제공합니다. 실제 약품 외형을 반드시 다시 확인하십시오."
 
 현재 분석된 약품: ${drugName} (일치율 ${pct}%)
 사용자 기저질환: ${userConditions || '없음'}
@@ -551,6 +575,99 @@ const STATUS_MAP = {
   caution: { icon: AlertTriangle, bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-700', badge: 'bg-amber-100 text-amber-800', label: '주의 필요' },
   danger: { icon: XCircle, bg: 'bg-red-50', border: 'border-red-200', text: 'text-red-700', badge: 'bg-red-100 text-red-800', label: '복용 위험' },
   unidentified: { icon: XCircle, bg: 'bg-slate-50', border: 'border-slate-200', text: 'text-slate-600', badge: 'bg-slate-100 text-slate-700', label: '인식 불가' },
+}
+
+const COMMUNITY_URL = 'https://www.a-ha.io/topic/%EC%95%BD%EC%98%81%EC%96%91%EC%A0%9C/%EC%95%BD%EB%B3%B5%EC%9A%A9?order=answerRegistration'
+
+const getConfidencePct = (confidence) => {
+  const raw = Number(confidence || 0)
+  const pct = raw <= 1 ? raw * 100 : raw
+  return Math.max(0, Math.min(100, Math.round(pct)))
+}
+
+const getConfidenceBand = (confidence) => {
+  const pct = getConfidencePct(confidence)
+  if (pct < 50) return 'blocked'
+  if (pct < 70) return 'low'
+  return 'usable'
+}
+
+const calculateMatchConfidence = ({ pillFeature, matchSource, drugInfo, permitInfo }) => {
+  let score = 100
+
+  // 식별/DB 매칭은 성공한 상태에서 환경적 불확실성만 차감한다.
+  if (matchSource === 'feature') score -= 10
+  else if (matchSource === 'imprint') score -= 5
+
+  if (!pillFeature?.imprint) score -= 5
+  if (!pillFeature?.drugName) score -= 3
+  if (!drugInfo) score -= 5
+  if (!permitInfo) score -= 3
+
+  const aiPct = getConfidencePct(pillFeature?.confidence)
+  if (aiPct > 0) {
+    if (aiPct < 65) score -= 10
+    else if (aiPct < 80) score -= 5
+    else if (aiPct < 90) score -= 3
+  }
+
+  return Math.max(50, Math.min(99, score)) / 100
+}
+
+function CommunityButton({ label = '약사 커뮤니티에 물어보기' }) {
+  return (
+    <a
+      href={COMMUNITY_URL}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="flex items-center justify-center gap-2 w-full py-3 rounded-xl bg-[#2563eb] text-white text-sm font-black shadow-sm shadow-blue-100 active:scale-95 transition-transform"
+    >
+      <MessageCircle size={16} /> {label}
+    </a>
+  )
+}
+
+// ─── AI 약물 상호작용 경고 카드 ──────────────────────────────────────────────
+function InteractionAlertCard({ interactions }) {
+  if (!interactions || interactions.length === 0) return null
+  const LEVEL_STYLE = {
+    danger:  { bg: 'bg-red-50',   border: 'border-red-400',   badge: 'bg-red-100 text-red-700',    icon: '🚫', label: '병용 금지' },
+    caution: { bg: 'bg-amber-50', border: 'border-amber-400', badge: 'bg-amber-100 text-amber-700',icon: '⚠️', label: '주의 필요' },
+    info:    { bg: 'bg-blue-50',  border: 'border-blue-300',  badge: 'bg-blue-100 text-blue-700',  icon: 'ℹ️', label: '참고' },
+  }
+  const topLevel = interactions.some(i => i.level === 'danger') ? 'danger' : interactions.some(i => i.level === 'caution') ? 'caution' : 'info'
+  const topStyle = LEVEL_STYLE[topLevel]
+  return (
+    <div className={`rounded-3xl border-2 ${topStyle.border} overflow-hidden animate-slide-up`}>
+      <div className={`px-4 py-3 flex items-center gap-2 ${topLevel === 'danger' ? 'bg-red-500' : topLevel === 'caution' ? 'bg-amber-500' : 'bg-blue-500'}`}>
+        <span className="text-lg">{topStyle.icon}</span>
+        <p className="text-white font-black text-sm flex-1">
+          {topLevel === 'danger' ? '⛔ 약물 상호작용 위험 감지!' : topLevel === 'caution' ? '⚠️ 약물 상호작용 주의' : '💡 약물 복용 참고사항'}
+        </p>
+        <span className="text-xs text-white/80 bg-white/20 px-2 py-0.5 rounded-full font-bold">{interactions.length}건</span>
+      </div>
+      <div className="divide-y divide-slate-100">
+        {interactions.map((item, i) => {
+          const s = LEVEL_STYLE[item.level] || LEVEL_STYLE.caution
+          return (
+            <div key={i} className={`px-4 py-3 ${s.bg} space-y-1.5`}>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${s.badge}`}>{s.label}</span>
+                {item.drugs?.map((d, j) => (
+                  <span key={j} className="text-xs font-bold text-slate-700 bg-white px-2 py-0.5 rounded-full border border-slate-200">{d}</span>
+                ))}
+              </div>
+              <p className="text-sm font-semibold text-slate-800">{item.reason}</p>
+              {item.advice && <p className="text-xs text-slate-500 leading-snug">{item.advice}</p>}
+            </div>
+          )
+        })}
+      </div>
+      <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-100">
+        <p className="text-[10px] text-slate-400 leading-snug">※ AI 분석 결과입니다. 복용 전 약사 또는 의사에게 반드시 확인하세요.</p>
+      </div>
+    </div>
+  )
 }
 
 // ─── DUR 경고 카드 ────────────────────────────────────────────────────────────
@@ -597,50 +714,174 @@ function PillListCard({ pillResults, onSelectPill, selectedIdx }) {
         const s = STATUS_MAP[pill.statusCode] || STATUS_MAP.caution
         const StatusIcon = s.icon
         const isSelected = selectedIdx === i
+        const confidencePct = getConfidencePct(pill.confidence)
+        const confidenceBand = getConfidenceBand(pill.confidence)
+        const isBlocked = confidenceBand === 'blocked'
+        const needsCommunity = confidenceBand === 'low'
+        const confidenceStyle = isBlocked
+          ? 'bg-red-100 text-red-700'
+          : needsCommunity
+            ? 'bg-amber-100 text-amber-700'
+            : 'bg-blue-100 text-blue-700'
         return (
-          <button
+          <div
             key={i}
-            onClick={() => onSelectPill(i)}
-            className={`w-full text-left rounded-2xl border-2 p-4 transition-all ${isSelected ? `${s.border} ${s.bg}` : 'border-slate-100 bg-white'}`}
+            className={`w-full rounded-2xl border-2 p-4 transition-all ${isSelected ? `${isBlocked ? 'border-red-300 bg-red-50 shadow-sm shadow-red-100' : needsCommunity ? 'border-amber-200 bg-amber-50' : `${s.border} ${s.bg}`}` : 'border-slate-100 bg-white'}`}
           >
-            <div className="flex items-center gap-3">
+            <button type="button" onClick={() => onSelectPill(i)} className="w-full text-left flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 text-lg"
                 style={{ background: pill.pillColor === '하양' ? '#f1f5f9' : pill.pillColor === '분홍' ? '#fce7f3' : pill.pillColor === '파랑' ? '#dbeafe' : pill.pillColor === '노랑' ? '#fef9c3' : pill.pillColor === '연두' ? '#dcfce7' : '#f1f5f9' }}>
                 💊
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <p className="font-bold text-sm text-slate-800 truncate">{pill.summary}</p>
-                  {pill.mfdsFound && <span className="text-[10px] bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded-full font-semibold shrink-0">식약처</span>}
+                  <p className={`font-bold text-sm truncate ${isBlocked ? 'text-red-800' : 'text-slate-800'}`}>{isBlocked ? '분석 결과 미표시' : pill.summary}</p>
+                  {!isBlocked && pill.mfdsFound && <span className="text-[10px] bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded-full font-semibold shrink-0">식약처</span>}
                 </div>
-                <p className="text-xs text-slate-400 mt-0.5">{pill.pillColor} · {pill.pillShape}{pill.pillImprint ? ` · 각인: ${pill.pillImprint}` : ''}{pill.entpName ? ` · ${pill.entpName}` : ''}</p>
-                <p className="text-xs text-slate-500 mt-1 line-clamp-2">{pill.description}</p>
+                <p className={`text-xs mt-0.5 ${isBlocked ? 'text-red-400' : 'text-slate-400'}`}>{pill.pillColor} · {pill.pillShape}{pill.pillImprint ? ` · 각인: ${pill.pillImprint}` : ''}{!isBlocked && pill.entpName ? ` · ${pill.entpName}` : ''}</p>
+                <p className={`text-xs mt-1 line-clamp-2 ${isBlocked ? 'text-red-600' : 'text-slate-500'}`}>
+                  {isBlocked ? '사용자 안전을 위해 약 정보를 표시하지 않습니다.' : (pill.description || pill.visualDescription || '식약처 효능 데이터 없음')}
+                </p>
               </div>
-              <div className={`text-xs font-bold px-2 py-1 rounded-full shrink-0 ${s.badge}`}>
-                {pill.mfdsFound ? '확인됨' : '미확인'}
+              <div className="flex flex-col items-end gap-1 shrink-0">
+                <span className={`text-xs font-black px-2 py-1 rounded-full ${isBlocked ? 'bg-red-100 text-red-700' : confidenceStyle}`}>{confidencePct}%</span>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isBlocked ? 'bg-red-200 text-red-800' : s.badge}`}>
+                  {isBlocked ? '차단' : pill.mfdsFound ? '확인됨' : '미확인'}
+                </span>
               </div>
-            </div>
-            {isSelected && pill.warnings && (
+            </button>
+            {isSelected && (
               <div className="mt-3 pt-3 border-t border-slate-100 space-y-2">
-                <div className="flex gap-2">
-                  <span className="text-xs font-bold text-slate-400 w-14 shrink-0">복용법</span>
-                  <span className="text-xs text-slate-600">{pill.dosageGuide}</span>
-                </div>
-                <div className="flex gap-2">
-                  <span className="text-xs font-bold text-slate-400 w-14 shrink-0">주의사항</span>
-                  <span className="text-xs text-slate-600">{pill.warnings}</span>
-                </div>
-                {pill.entpName && (
-                  <div className="flex gap-2">
-                    <span className="text-xs font-bold text-slate-400 w-14 shrink-0">제조사</span>
-                    <span className="text-xs text-slate-600">{pill.entpName}</span>
-                  </div>
+                {isBlocked ? (
+                  <>
+                    <div className="rounded-xl bg-white p-3 border border-red-100">
+                      <p className="text-sm font-black text-red-700">안전을 최우선으로 합니다.</p>
+                      <p className="text-xs text-red-600 leading-relaxed mt-1">
+                        정확도가 50% 미만이라 분석 결과를 표시하지 않습니다. 잘못된 약 정보 제공을 막기 위한 안전 조치입니다.
+                      </p>
+                    </div>
+                    <CommunityButton label="전문가에게 문의하러 가기" />
+                  </>
+                ) : (
+                  <>
+                    <div className="rounded-xl bg-white p-3 border border-slate-100">
+                      <p className="text-[10px] font-black text-blue-500 uppercase mb-1">AI Analysis Report</p>
+                      <p className="text-xs text-slate-600 leading-relaxed">식약처 데이터와 대조된 약품 정보입니다.</p>
+                    </div>
+                    {needsCommunity && (
+                      <div className="rounded-xl bg-amber-100 p-3 border border-amber-200">
+                        <p className="text-xs text-amber-800 leading-relaxed">
+                          정확도가 70% 이하입니다. 최종 복용 전 실제 약품 외형을 다시 확인하거나 전문가에게 질문하세요.
+                        </p>
+                      </div>
+                    )}
+                    <div className="flex gap-2">
+                      <span className="text-xs font-bold text-slate-400 w-14 shrink-0">성분</span>
+                      <span className="text-xs text-slate-600">{pill.activeIngredients?.join(', ') || '식약처 데이터 없음'}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <span className="text-xs font-bold text-slate-400 w-14 shrink-0">효능</span>
+                      <span className="text-xs text-slate-600">{pill.description || '식약처 효능 데이터 없음'}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <span className="text-xs font-bold text-slate-400 w-14 shrink-0">복용법</span>
+                      <span className="text-xs text-slate-600">{pill.dosageGuide || '식약처 데이터 없음'}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <span className="text-xs font-bold text-slate-400 w-14 shrink-0">주의사항</span>
+                      <span className="text-xs text-slate-600">{pill.warnings || '식약처 데이터 없음'}</span>
+                    </div>
+                    {pill.storageMethod && (
+                      <div className="flex gap-2">
+                        <span className="text-xs font-bold text-slate-400 w-14 shrink-0">보관법</span>
+                        <span className="text-xs text-slate-600">{pill.storageMethod}</span>
+                      </div>
+                    )}
+                    {pill.entpName && (
+                      <div className="flex gap-2">
+                        <span className="text-xs font-bold text-slate-400 w-14 shrink-0">제조사</span>
+                        <span className="text-xs text-slate-600">{pill.entpName}</span>
+                      </div>
+                    )}
+                    {needsCommunity && <CommunityButton />}
+                  </>
                 )}
               </div>
             )}
-          </button>
+          </div>
         )
       })}
+    </div>
+  )
+}
+
+function AnalysisEvidenceCard({ pill, symptom, pillCount = 1 }) {
+  if (!pill) return null
+  const confidencePct = getConfidencePct(pill.confidence)
+  const confidenceBand = getConfidenceBand(pill.confidence)
+
+  if (confidenceBand === 'blocked') {
+    return (
+      <div className="rounded-2xl p-4 border-2 border-red-300 bg-red-50 animate-slide-up space-y-3 shadow-sm shadow-red-100">
+        <div className="flex items-center gap-2">
+          <span className="text-xl">🚫</span>
+          <p className="font-black text-red-800 text-lg">안전을 최우선으로 합니다.</p>
+          <span className="ml-auto text-xs font-black text-red-700 bg-red-100 px-2 py-1 rounded-full">{confidencePct}%</span>
+        </div>
+        <p className="text-sm text-red-700 leading-relaxed font-medium">
+          AI 분석 정확도가 50% 미만이라 약 정보를 표시하지 않습니다. 사용자가 확신이 들지 않을 때는 전문가에게 문의하도록 연결합니다.
+        </p>
+        <CommunityButton label="전문가에게 문의하러 가기" />
+      </div>
+    )
+  }
+
+  const isLow = confidenceBand === 'low'
+  const hasMultiplePills = pillCount > 1
+  const symptomText = symptom?.trim() || '입력하신 증상'
+  const approvedPurpose = pill.description || '식약처 효능 데이터가 확인되지 않았습니다.'
+  const dosageText = pill.dosageGuide && pill.dosageGuide !== '-' ? pill.dosageGuide : '상세 가이드 보기'
+  const warningText = pill.warnings || '식약처 데이터 없음'
+
+  return (
+    <div className={`rounded-2xl p-4 border-2 animate-slide-up space-y-3 ${isLow ? 'border-amber-200 bg-amber-50' : 'border-blue-200 bg-blue-50'}`}>
+      <div className="flex items-start gap-3">
+        <div className={`w-12 h-12 rounded-2xl flex flex-col items-center justify-center shrink-0 ${isLow ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'}`}>
+          <span className="text-base font-black leading-none">{confidencePct}%</span>
+          <span className="text-[9px] font-bold">일치</span>
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className={`font-black text-sm ${isLow ? 'text-amber-800' : 'text-blue-800'}`}>
+            식약처 데이터 대조 결과: {isLow ? '추가 확인이 필요합니다' : '식약처 데이터와 일치합니다'}
+          </p>
+          <p className="text-xs text-slate-600 leading-relaxed mt-1">아래 정보는 식약처 데이터와 대조된 약품 정보입니다.</p>
+        </div>
+      </div>
+      {hasMultiplePills ? (
+        <div className="rounded-xl bg-white p-3 border border-slate-100">
+          <p className="text-sm text-slate-700 leading-relaxed font-medium">
+            여러 알약이 감지되었습니다. 각 알약별 성분, 복용법, 주의사항은 아래 알약 카드에서 확인해 주세요.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-xl bg-white p-3 border border-slate-100">
+          <p className="text-[10px] font-black text-slate-400 uppercase mb-2">분석된 알약 정보</p>
+          <div className="space-y-2 text-sm text-slate-700 leading-relaxed font-medium">
+            <p>• {pill.summary}</p>
+            <p>• 주요 성분: {pill.activeIngredients?.join(', ') || '식약처 데이터 없음'}</p>
+            <div className="rounded-xl bg-slate-50 p-3 border border-slate-100">
+              <p>
+                본 성분은 주로 [{approvedPurpose}] 목적으로 허가되었으며,
+                식약처 승인 기준 [{symptomText}] 치료 및 완화용으로 승인된 성분이 아닙니다.
+              </p>
+            </div>
+            <p>• 복용법: {dosageText}</p>
+            <p>• 주의사항: {warningText}</p>
+            <p>• 더 정확한 확인이 필요하신가요? 약사 커뮤니티를 이용해 주세요.</p>
+          </div>
+        </div>
+      )}
+      {isLow && <CommunityButton />}
     </div>
   )
 }
@@ -818,7 +1059,7 @@ function ResultCard({ result, mfdsInfo, onChat, onRetry }) {
                 </p>
               </div>
               <a
-                href="https://www.a-ha.io/topic/%EC%95%BD%EC%98%81%EC%96%91%EC%A0%9C/%EC%95%BD%EB%B3%B5%EC%9A%A9?order=answerRegistration"
+                href={COMMUNITY_URL}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center justify-center gap-2 w-full py-3 rounded-xl font-bold text-sm text-white"
@@ -849,7 +1090,7 @@ function ResultCard({ result, mfdsInfo, onChat, onRetry }) {
                 </p>
               </div>
               <a
-                href="https://www.a-ha.io/topic/%EC%95%BD%EC%98%81%EC%96%91%EC%A0%9C/%EC%95%BD%EB%B3%B5%EC%9A%A9?order=answerRegistration"
+                href={COMMUNITY_URL}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center justify-center gap-2 w-full py-3.5 rounded-xl font-black text-sm text-white"
@@ -1147,9 +1388,9 @@ function OnboardingSlides({ onComplete }) {
   const slides = [
     {
       emoji: '💊',
-      title: '이거 돼? 입니다',
-      desc: '약 사진 한 장으로 성분, 효능, 주의사항을 바로 확인하세요',
-      tips: ['AI가 알약을 직접 분석해드려요', '식약처 공식 데이터로 정확하게 알려드려요', '처방약도 일반약도 모두 확인 가능해요'],
+      title: '앱 사용법',
+      desc: '약 사진 한 장으로 식약처 공식 정보를 빠르게 대조하세요',
+      tips: ['AI는 알약 종류 식별만 도와줘요', '복용 판단은 하지 않아요', '식약처 공식 데이터에 근거해 안내해요'],
       color: '#0192F5',
     },
     {
@@ -1162,15 +1403,15 @@ function OnboardingSlides({ onComplete }) {
     {
       emoji: '🔍',
       title: '분석 결과 확인',
-      desc: 'AI와 식약처 DB가 함께 각 알약의 성분과 효능을 알려드려요',
-      tips: ['알약마다 성분과 효능을 따로 확인할 수 있어요', '식약처 공식 정보를 우선으로 보여드려요', '신뢰도 점수로 결과의 정확성을 알 수 있어요'],
+      desc: '정확도와 식약처 승인 효능을 함께 확인하세요',
+      tips: ['정확도 퍼센트로 식별 신뢰도를 보여줘요', '성분, 복용법, 주의사항, 보관법을 확인할 수 있어요', '50% 미만이면 안전을 위해 약 정보를 숨겨요'],
       color: '#16A34A',
     },
     {
       emoji: '💬',
-      title: 'AI 약사에게 물어보세요',
-      desc: '분석 결과를 바탕으로 궁금한 점을 바로 물어볼 수 있어요',
-      tips: ['식전/식후 복용 여부', '다른 약과 함께 먹어도 되는지', '부작용이 있는지'],
+      title: '불확실하면 전문가에게',
+      desc: '정확도가 낮거나 확신이 들지 않으면 약사 커뮤니티로 연결해요',
+      tips: ['70% 이하 결과에는 질문 버튼을 보여줘요', '50% 미만 결과는 약 정보를 제공하지 않아요', '안전하지 않은 추측 답변을 줄이는 장치예요'],
       color: '#7C3AED',
     },
   ]
@@ -1199,7 +1440,7 @@ function OnboardingSlides({ onComplete }) {
         </div>
         {current === 0 ? (
           <div style={{ alignSelf: 'stretch', display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {['AI 약품 분석', '식약처 공식 데이터 연동', '처방약 · 일반약 모두 가능'].map((feat, i) => (
+            {['AI 외형 식별', '식약처 공식 데이터 연동', '정확도 기반 안전 차단'].map((feat, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#F0F7FF', borderRadius: 14, padding: '14px 18px', border: '1px solid #BDE0FF' }}>
                 <span style={{ fontSize: 18 }}>{['🤖', '🏥', '💊'][i]}</span>
                 <span style={{ fontSize: 14, color: '#0192F5', fontWeight: 600 }}>{feat}</span>
@@ -1302,6 +1543,7 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
   const [selectedPillIdx, setSelectedPillIdx] = useState(0)
   const fileInputRef = useRef(null)
   const [step, setStep] = useState(previewUrl || analysisResult ? 2 : 1)
+  const selectedPill = pillResults[selectedPillIdx] || pillResults[0]
   if ((previewUrl || analyzing || mfdsLoading) && step === 1) setStep(2)
 
   const handleFileChange = (e) => {
@@ -1382,36 +1624,13 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
           </div>
         )}
         {(analyzing || mfdsLoading) && <AnalyzingSkeleton mfdsLoading={mfdsLoading} />}
-        {!analyzing && !mfdsLoading && combinedAnalysis && (
-          <div className={`rounded-2xl p-4 border-2 ${
-            combinedAnalysis.recommendCode === 'safe' ? 'bg-green-50 border-emerald-200' :
-            combinedAnalysis.recommendCode === 'danger' ? 'bg-red-50 border-red-200' :
-            'bg-amber-50 border-amber-200'
-          }`}>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xl">
-                {combinedAnalysis.recommendCode === 'safe' ? '✅' : combinedAnalysis.recommendCode === 'danger' ? '❌' : '⚠️'}
-              </span>
-              <p className={`font-black text-lg ${
-                combinedAnalysis.recommendCode === 'safe' ? 'text-emerald-700' :
-                combinedAnalysis.recommendCode === 'danger' ? 'text-red-700' : 'text-amber-700'
-              }`}>{combinedAnalysis.recommendation}</p>
-            </div>
-            <p className="text-sm text-slate-700 font-medium mb-1">{combinedAnalysis.oneLineSummary}</p>
-            <p className="text-sm text-slate-600 leading-relaxed">{combinedAnalysis.combinedUse}</p>
-            {symptom && (
-              <div className="mt-2 pt-2 border-t border-slate-200 flex items-start gap-2">
-                <span className="text-xs font-bold text-slate-400 shrink-0">증상 비교</span>
-                <span className={`text-xs font-semibold ${
-                  combinedAnalysis.matchScore === '높음' ? 'text-emerald-600' :
-                  combinedAnalysis.matchScore === '낮음' ? 'text-red-500' : 'text-amber-600'
-                }`}>{combinedAnalysis.matchScore}</span>
-                <span className="text-xs text-slate-500">{combinedAnalysis.matchReason}</span>
-              </div>
-            )}
-          </div>
+        {!analyzing && !mfdsLoading && selectedPill && (
+          <AnalysisEvidenceCard pill={selectedPill} symptom={symptom} pillCount={pillResults.length} />
         )}
-        {!analyzing && !mfdsLoading && durWarnings?.length > 0 && (
+        {!analyzing && !mfdsLoading && getConfidenceBand(selectedPill?.confidence) !== 'blocked' && combinedAnalysis?.drugInteractions?.length > 0 && (
+          <InteractionAlertCard interactions={combinedAnalysis.drugInteractions} />
+        )}
+        {!analyzing && !mfdsLoading && getConfidenceBand(selectedPill?.confidence) !== 'blocked' && durWarnings?.length > 0 && (
           <DurWarningCard warnings={durWarnings} />
         )}
         {!analyzing && !mfdsLoading && pillResults.length > 0 && (
@@ -1424,7 +1643,7 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
         {!analyzing && !mfdsLoading && pillResults.length === 0 && analysisResult && analysisResult.statusCode === 'unidentified' && (
           <ResultCard result={analysisResult} mfdsInfo={null} onChat={onChat} onRetry={() => { onRetry(); setStep(2) }} />
         )}
-        {!analyzing && !mfdsLoading && pillResults.length > 0 && (
+        {!analyzing && !mfdsLoading && pillResults.length > 0 && getConfidenceBand(selectedPill?.confidence) !== 'blocked' && (
           <button
             onClick={onChat}
             className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-[#0192F5] to-[#40BEFD] text-white font-bold flex items-center justify-center gap-2 shadow-md active:scale-95 transition-all"

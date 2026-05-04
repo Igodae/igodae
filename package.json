@@ -1,6 +1,6 @@
 {
   "name": "igeordwae",
-  "version": "1.0.0",
+  "version": "0.3.0",
   "description": "이거돼? - 지능형 약물 판독 & 복약 가이드 앱",
   "type": "module",
   "scripts": {
