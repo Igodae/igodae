@@ -1544,7 +1544,12 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
   const fileInputRef = useRef(null)
   const [step, setStep] = useState(previewUrl || analysisResult ? 2 : 1)
   const selectedPill = pillResults[selectedPillIdx] || pillResults[0]
-  if ((previewUrl || analyzing || mfdsLoading) && step === 1) setStep(2)
+
+  useEffect(() => {
+    if ((previewUrl || analyzing || mfdsLoading) && step === 1) {
+      setStep(2)
+    }
+  }, [previewUrl, analyzing, mfdsLoading, step])
 
   const handleFileChange = (e) => {
     const file = e.target.files?.[0]
