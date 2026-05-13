@@ -1,6 +1,58 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 
+function groqDevProxy(env) {
+  return {
+    name: 'groq-dev-proxy',
+    configureServer(server) {
+      server.middlewares.use('/api/groq-proxy', async (req, res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+
+        if (req.method === 'OPTIONS') {
+          res.statusCode = 200
+          res.end()
+          return
+        }
+
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end(JSON.stringify({ error: 'Method not allowed' }))
+          return
+        }
+
+        const apiKey = env.GROQ_API_KEY || env.VITE_GROQ_API_KEY
+        if (!apiKey) {
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: 'GROQ_API_KEY not configured' }))
+          return
+        }
+
+        try {
+          const chunks = []
+          for await (const chunk of req) chunks.push(chunk)
+          const body = Buffer.concat(chunks).toString('utf8')
+
+          const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body,
+          })
+          const text = await upstream.text()
+          res.statusCode = upstream.status
+          res.end(text)
+        } catch (error) {
+          res.statusCode = 502
+          res.end(JSON.stringify({ error: error.message }))
+        }
+      })
+    },
+  }
+}
+
 function mfdsDevProxy(env) {
   const endpoints = {
     drugInfo: 'https://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList',
@@ -54,7 +106,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
   return {
-  plugins: [react(), mfdsDevProxy(env)],
+  plugins: [react(), mfdsDevProxy(env), groqDevProxy(env)],
   server: {
     port: 3000,
     host: true

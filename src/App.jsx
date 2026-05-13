@@ -26,11 +26,11 @@ const firebaseConfig = {
 }
 
 const APP_ID = import.meta.env.VITE_APP_ID || 'igeordwae-dev'
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY
 const MFDS_API_KEY = import.meta.env.VITE_MFDS_API_KEY
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
-const GROQ_BASE = 'https://api.groq.com/openai/v1'
+// Groq API는 CORS 미지원 → 서버리스 프록시 경유 (키도 서버 환경변수로만 보관)
+const GROQ_PROXY = '/api/groq-proxy'
 
 // ─── 식약처 API 엔드포인트 (Vercel 프록시 경유) ───────────────────────────────
 const MFDS_PROXY = '/api/mfds-proxy'
@@ -61,12 +61,11 @@ const LOGS_PATH = () => collection(db, `artifacts/${APP_ID}/public/data/analysis
 
 // ─── Groq API 호출 (지수 백오프) ─────────────────────────────────────────────
 async function safeFetchGroq(body, retries = 3, delay = 1000) {
-  if (!GROQ_API_KEY) throw new Error('VITE_GROQ_API_KEY 환경변수가 설정되지 않았습니다.')
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(`${GROQ_BASE}/chat/completions`, {
+      const res = await fetch(GROQ_PROXY, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
       if (res.status === 401) throw new Error('API 키가 유효하지 않습니다.')
@@ -84,7 +83,7 @@ async function safeFetchGroq(body, retries = 3, delay = 1000) {
 
 // ─── 식약처 텍스트 AI 요약 ───────────────────────────────────────────────────
 async function summarizeMfdsText(label, text) {
-  if (!GROQ_API_KEY || !text || text.length < 50) return text
+  if (!text || text.length < 50) return text
   try {
     const data = await safeFetchGroq({
       model: GROQ_MODEL,
@@ -320,7 +319,7 @@ async function runDurCheck(pillResults, userProfile = {}) {
 
 // ─── 알약 종합 분석 (병용 안전성 포함) ─────────────────────────────────────────
 async function analyzePillsCombined(pillResults, symptom) {
-  if (!GROQ_API_KEY || pillResults.length === 0) return null
+  if (pillResults.length === 0) return null
   try {
     const pillSummary = pillResults.map((p, i) =>
       `${i+1}. 약품명: ${p.summary} | 성분: ${p.activeIngredients?.join(', ') || '알수없음'} | 효능: ${p.description}`
@@ -1782,34 +1781,22 @@ export default function App() {
     setDurWarnings([])
 
     let aiResult
-    if (!GROQ_API_KEY) {
-      await new Promise(r => setTimeout(r, 1500))
-      aiResult = {
-        pills: [
-          { drugName: '', color: '하양', shape: '원형', form: '정제', imprint: '', size: '중', description: '흰색 원형 알약' },
-          { drugName: '', color: '분홍', shape: '타원형', form: '정제', imprint: '', size: '소', description: '분홍색 타원형 알약' },
-        ],
-        totalCount: 2,
-        symptomHint: 'API 키 미설정'
-      }
-    } else {
-      try {
-        const data = await safeFetchGroq({
-          model: GROQ_VISION_MODEL,
-          messages: [{ role: 'user', content: [
-            { type: 'text', text: buildVisionPrompt(userConditions, symptom) },
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } }
-          ]}],
-          temperature: 0.1,
-          max_tokens: 1000,
-        })
-        const raw = data.choices?.[0]?.message?.content || '{}'
-        aiResult = JSON.parse(raw.replace(/```json|```/g, '').trim())
-      } catch (e) {
-        setAnalysisResult({ statusCode: 'unidentified', summary: '분석 실패', description: e.message, confidence: 0 })
-        setAnalyzing(false)
-        return
-      }
+    try {
+      const data = await safeFetchGroq({
+        model: GROQ_VISION_MODEL,
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: buildVisionPrompt(userConditions, symptom) },
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } }
+        ]}],
+        temperature: 0.1,
+        max_tokens: 1000,
+      })
+      const raw = data.choices?.[0]?.message?.content || '{}'
+      aiResult = JSON.parse(raw.replace(/```json|```/g, '').trim())
+    } catch (e) {
+      setAnalysisResult({ statusCode: 'unidentified', summary: '분석 실패', description: e.message, confidence: 0 })
+      setAnalyzing(false)
+      return
     }
 
     setAnalyzing(false)
