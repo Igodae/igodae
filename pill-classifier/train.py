@@ -40,7 +40,9 @@ IMAGE_DIR  = DATA_DIR / 'images'
 OUTPUT_DIR = BASE_DIR / 'output'
 
 API_KEY    = '73d5d41569516c5a7259f3928ea2de8af44ded772f2a6cb4d6f5dbe27b0f62cd'
-MFDS_URL   = 'https://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService03/getMdcinGrnIdntfcInfoList03'
+# 식약처 API 2개 (이미지 있는 것만)
+MFDS_PILL_URL = 'https://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService03/getMdcinGrnIdntfcInfoList03'
+MFDS_DRUG_URL = 'https://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList'
 
 EMB_DIM    = 512
 BATCH_SIZE = 64
@@ -71,7 +73,7 @@ else:
 #  Phase 1: 데이터 수집 (식약처 API)
 # ════════════════════════════════════════════════════════════
 
-def fetch_page(page_no=1, num_of_rows=100):
+def fetch_page(api_url, page_no=1, num_of_rows=100):
     params = {
         'serviceKey': API_KEY,
         'pageNo': page_no,
@@ -79,7 +81,7 @@ def fetch_page(page_no=1, num_of_rows=100):
         'type': 'json',
     }
     try:
-        resp = requests.get(MFDS_URL, params=params, timeout=15)
+        resp = requests.get(api_url, params=params, timeout=15)
         resp.raise_for_status()
         body = resp.json().get('body', {})
         items = body.get('items', [])
@@ -91,6 +93,26 @@ def fetch_page(page_no=1, num_of_rows=100):
     except Exception as e:
         print(f'  오류: {e}')
         return [], 0
+
+
+def fetch_all_items(api_url, label):
+    """API 하나에서 전체 항목 수집"""
+    _, total = fetch_page(api_url, 1, 1)
+    print(f'  [{label}] 전체: {total:,}개')
+
+    all_items = []
+    page = 1
+    pbar = tqdm(total=total, desc=f'  {label}')
+    while len(all_items) < total:
+        items, _ = fetch_page(api_url, page, 100)
+        if not items:
+            break
+        all_items.extend(items)
+        pbar.update(len(items))
+        page += 1
+        time.sleep(0.3)
+    pbar.close()
+    return all_items
 
 
 def download_image(url, save_path):
@@ -112,8 +134,47 @@ def safe_dirname(name):
     return ''.join(c for c in name if c not in r'\/:*?"<>|').strip()[:50]
 
 
+def extract_items_with_images(items, source_label):
+    """API 응답에서 이미지 있는 항목 추출 (필드명 자동감지)"""
+    if not items:
+        return []
+
+    sample = items[0]
+    # 낱알식별 API vs 의약품개요 API 필드명 차이 처리
+    img_candidates  = ['ITEM_IMAGE', 'itemImage']
+    name_candidates = ['ITEM_NAME', 'itemName']
+    code_candidates = ['ITEM_SEQ', 'itemSeq']
+
+    img_field  = next((f for f in img_candidates  if f in sample), None)
+    name_field = next((f for f in name_candidates if f in sample), None)
+    code_field = next((f for f in code_candidates if f in sample), None)
+
+    if not img_field or not name_field:
+        print(f'  ⚠️ [{source_label}] 이미지/이름 필드 없음')
+        return []
+
+    results = []
+    for item in items:
+        url  = (item.get(img_field) or '').strip()
+        name = (item.get(name_field) or '').strip()
+        code = (item.get(code_field) or str(hash(name))).strip()
+        if not url or not name:
+            continue
+        results.append({
+            'name': name,
+            'code': code,
+            'url': url,
+            'shape': item.get('DRUG_SHAPE') or item.get('drugShape') or '',
+            'color_front': item.get('COLOR_CLASS1') or item.get('colorClass1') or '',
+            'color_back': item.get('COLOR_CLASS2') or item.get('colorClass2') or '',
+            'print_front': item.get('PRINT_FRONT') or item.get('printFront') or '',
+            'print_back': item.get('PRINT_BACK') or item.get('printBack') or '',
+        })
+    return results
+
+
 def collect_data():
-    """식약처 API에서 약품 정보 + 이미지 다운로드"""
+    """식약처 API 2개에서 약품 정보 + 이미지 다운로드"""
     csv_path = DATA_DIR / 'pills.csv'
 
     if csv_path.exists():
@@ -124,55 +185,50 @@ def collect_data():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print('\n📥 Phase 1-1: 약품 목록 수집')
-    _, total = fetch_page(1, 1)
-    print(f'  전체 약품 수: {total:,}개')
+    # ── API 2개에서 수집 ──
+    print('\n📥 Phase 1-1: 약품 목록 수집 (식약처 API 2개)')
 
-    all_items = []
-    page = 1
-    pbar = tqdm(total=total, desc='  약품 정보')
-    while len(all_items) < total:
-        items, _ = fetch_page(page, 100)
-        if not items:
-            break
-        all_items.extend(items)
-        pbar.update(len(items))
-        page += 1
-        time.sleep(0.3)
-    pbar.close()
-    print(f'  수집 완료: {len(all_items):,}개')
+    pill_items = fetch_all_items(MFDS_PILL_URL, '낱알식별')
+    drug_items = fetch_all_items(MFDS_DRUG_URL, '의약품개요')
 
-    sample = all_items[0]
-    img_field  = 'ITEM_IMAGE' if 'ITEM_IMAGE' in sample else 'itemImage'
-    name_field = 'ITEM_NAME'  if 'ITEM_NAME'  in sample else 'itemName'
-    code_field = 'ITEM_SEQ'   if 'ITEM_SEQ'   in sample else 'itemSeq'
+    pill_extracted = extract_items_with_images(pill_items, '낱알식별')
+    drug_extracted = extract_items_with_images(drug_items, '의약품개요')
 
-    with_image = [i for i in all_items if i.get(img_field)]
-    print(f'  이미지 있는 항목: {len(with_image):,}개')
+    print(f'  낱알식별 이미지: {len(pill_extracted):,}개')
+    print(f'  의약품개요 이미지: {len(drug_extracted):,}개')
 
+    # 중복 제거 (약 이름 기준, 낱알식별 우선)
+    seen_names = set()
+    all_extracted = []
+    for item in pill_extracted:
+        if item['name'] not in seen_names:
+            seen_names.add(item['name'])
+            all_extracted.append(item)
+    for item in drug_extracted:
+        if item['name'] not in seen_names:
+            seen_names.add(item['name'])
+            all_extracted.append(item)
+
+    print(f'  중복 제거 후: {len(all_extracted):,}개')
+
+    # ── 이미지 다운로드 ──
     print('\n📥 Phase 1-2: 이미지 다운로드')
     tasks = []
     metadata = []
-    for item in with_image:
-        name = item.get(name_field, '').strip()
-        code = item.get(code_field, '').strip()
-        url  = item.get(img_field, '').strip()
-        if not name or not url:
-            continue
-
-        class_dir = IMAGE_DIR / safe_dirname(name)
+    for item in all_extracted:
+        class_dir = IMAGE_DIR / safe_dirname(item['name'])
         class_dir.mkdir(exist_ok=True)
-        save_path = class_dir / f'{code}.jpg'
+        save_path = class_dir / f'{item["code"]}.jpg'
 
-        tasks.append((url, save_path))
+        tasks.append((item['url'], save_path))
         metadata.append({
-            'item_code': code,
-            'item_name': name,
-            'shape': item.get('DRUG_SHAPE') or '',
-            'color_front': item.get('COLOR_CLASS1') or '',
-            'color_back': item.get('COLOR_CLASS2') or '',
-            'print_front': item.get('PRINT_FRONT') or '',
-            'print_back': item.get('PRINT_BACK') or '',
+            'item_code': item['code'],
+            'item_name': item['name'],
+            'shape': item['shape'],
+            'color_front': item['color_front'],
+            'color_back': item['color_back'],
+            'print_front': item['print_front'],
+            'print_back': item['print_back'],
             'image_path': str(save_path),
         })
 
