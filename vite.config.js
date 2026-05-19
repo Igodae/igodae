@@ -158,7 +158,8 @@ export default defineConfig(({ mode }) => {
   plugins: [react(), mfdsDevProxy(env), groqDevProxy(env), modelDevProxy()],
   server: {
     port: 3000,
-    host: true
+    host: true,
+    allowedHosts: ['.ngrok-free.dev', '.ngrok.io']
   }
   }
 })

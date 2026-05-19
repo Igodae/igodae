@@ -60,6 +60,7 @@ try {
 }
 
 const LOGS_PATH = () => collection(db, `artifacts/${APP_ID}/public/data/analysis_logs`)
+const CORRECTIONS_PATH = () => collection(db, `artifacts/${APP_ID}/public/data/corrections`)
 
 // ─── Groq API 호출 (지수 백오프) ─────────────────────────────────────────────
 async function safeFetchGroq(body, retries = 3, delay = 1000) {
@@ -736,6 +737,139 @@ function DurWarningCard({ warnings }) {
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ─── 정정하기 모달 (팀원 테스트용 — Active Learning 데이터 수집) ──────────────
+function CorrectionModal({ isOpen, onClose, currentImage, currentResult, onSubmit }) {
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [searching, setSearching] = useState(false)
+  const [selectedName, setSelectedName] = useState('')
+  const [customName, setCustomName] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitted, setSubmitted] = useState(false)
+
+  if (!isOpen) return null
+
+  const searchMfds = async () => {
+    if (!searchQuery.trim()) return
+    setSearching(true)
+    try {
+      const res = await fetch(`${MFDS_PROXY}?endpoint=drugInfo&itemName=${encodeURIComponent(searchQuery.trim())}`)
+      if (res.ok) {
+        const data = await res.json()
+        const items = data?.body?.items || []
+        const list = Array.isArray(items) ? items : [items]
+        setSearchResults(list.filter(it => it?.itemName).slice(0, 10))
+      } else {
+        setSearchResults([])
+      }
+    } catch { setSearchResults([]) }
+    setSearching(false)
+  }
+
+  const handleSubmit = async () => {
+    const correctName = selectedName || customName.trim()
+    if (!correctName) return
+    setSubmitting(true)
+    try {
+      await onSubmit({
+        correctDrugName: correctName,
+        originalResult: currentResult?.summary || '미인식',
+        originalConfidence: currentResult?.confidence || 0,
+        image: currentImage,
+      })
+      setSubmitted(true)
+    } catch (e) { console.warn('정정 저장 실패:', e.message) }
+    setSubmitting(false)
+  }
+
+  if (submitted) {
+    return (
+      <div className="fixed inset-0 z-[9999] bg-black/50 flex items-end justify-center" onClick={onClose}>
+        <div className="w-full max-w-[480px] bg-white rounded-t-3xl p-6 space-y-4 animate-slide-up" onClick={e => e.stopPropagation()}>
+          <div className="text-center space-y-2">
+            <span className="text-5xl">✅</span>
+            <p className="font-bold text-lg text-slate-800">정정 완료!</p>
+            <p className="text-sm text-slate-500">학습 데이터에 반영됩니다. 감사합니다!</p>
+          </div>
+          <button onClick={onClose} className="w-full py-3 rounded-2xl bg-slate-100 text-slate-600 font-bold">닫기</button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="fixed inset-0 z-[9999] bg-black/50 flex items-end justify-center" onClick={onClose}>
+      <div className="w-full max-w-[480px] bg-white rounded-t-3xl p-5 space-y-4 animate-slide-up max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="text-center">
+          <p className="font-bold text-lg text-slate-800">🔧 약 이름 정정하기</p>
+          <p className="text-xs text-slate-400 mt-1">AI가 잘못 인식했다면 올바른 약 이름을 알려주세요</p>
+        </div>
+
+        {currentResult?.summary && (
+          <div className="bg-red-50 rounded-xl p-3 border border-red-100">
+            <p className="text-xs text-red-400 font-semibold">AI 분석 결과</p>
+            <p className="text-sm font-bold text-red-700">{currentResult.summary}</p>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <p className="text-xs font-bold text-slate-500">식약처 DB에서 검색</p>
+          <div className="flex gap-2">
+            <input
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && searchMfds()}
+              placeholder="약 이름 입력 (예: 타이레놀)"
+              className="flex-1 px-3 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-blue-400"
+            />
+            <button onClick={searchMfds} disabled={searching} className="px-4 py-2.5 rounded-xl bg-[#0192F5] text-white text-sm font-bold shrink-0 disabled:opacity-50">
+              {searching ? '...' : '검색'}
+            </button>
+          </div>
+        </div>
+
+        {searchResults.length > 0 && (
+          <div className="space-y-1.5 max-h-40 overflow-y-auto">
+            {searchResults.map((item, i) => (
+              <button
+                key={i}
+                onClick={() => { setSelectedName(item.itemName); setCustomName('') }}
+                className={`w-full text-left px-3 py-2.5 rounded-xl border text-sm transition-all ${
+                  selectedName === item.itemName ? 'border-blue-400 bg-blue-50 font-bold text-blue-700' : 'border-slate-100 bg-slate-50 text-slate-700'
+                }`}
+              >
+                <p className="font-semibold truncate">{item.itemName}</p>
+                {item.entpName && <p className="text-xs text-slate-400">{item.entpName}</p>}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <p className="text-xs font-bold text-slate-500">또는 직접 입력</p>
+          <input
+            value={customName}
+            onChange={e => { setCustomName(e.target.value); setSelectedName('') }}
+            placeholder="정확한 약 이름을 입력하세요"
+            className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-blue-400"
+          />
+        </div>
+
+        <div className="flex gap-2 pt-2">
+          <button onClick={onClose} className="flex-1 py-3 rounded-2xl bg-slate-100 text-slate-500 font-bold text-sm">취소</button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting || (!selectedName && !customName.trim())}
+            className="flex-[2] py-3 rounded-2xl bg-gradient-to-r from-[#0192F5] to-[#40BEFD] text-white font-bold text-sm disabled:opacity-40"
+          >
+            {submitting ? '저장 중...' : '정정 제출'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -1577,10 +1711,11 @@ function CameraView({ onCapture, onCancel }) {
 }
 
 // ─── 홈 뷰 ───────────────────────────────────────────────────────────────────
-function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combinedAnalysis, durWarnings, analyzing, mfdsLoading, onCameraCapture, onGalleryUpload, onChat, onHistory, onRetry, previewUrl, logCount, symptom, onSymptomChange, onLogoTap }) {
+function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combinedAnalysis, durWarnings, analyzing, mfdsLoading, onCameraCapture, onGalleryUpload, onChat, onHistory, onRetry, previewUrl, logCount, symptom, onSymptomChange, onLogoTap, onCorrection, capturedImageBase64 }) {
   const [selectedPillIdx, setSelectedPillIdx] = useState(0)
   const fileInputRef = useRef(null)
   const [step, setStep] = useState(previewUrl || analysisResult ? 2 : 1)
+  const [showCorrection, setShowCorrection] = useState(false)
   const selectedPill = pillResults[selectedPillIdx] || pillResults[0]
 
   useEffect(() => {
@@ -1717,13 +1852,23 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
       {step === 2 && (
         <div className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[480px] px-5 pb-8 pt-4 bg-gradient-to-t from-white via-white to-transparent">
           {(analyzing || mfdsLoading || pillResults.length > 0 || (analysisResult && analysisResult.statusCode === 'unidentified')) ? (
-            <button
-              onClick={() => { onRetry(); setStep(2) }}
-              disabled={analyzing || mfdsLoading}
-              className="w-full py-4 rounded-2xl bg-slate-100 text-slate-600 font-bold flex items-center justify-center gap-2 disabled:opacity-40"
-            >
-              <RefreshCw size={18} /> 다시 촬영하기
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { onRetry(); setStep(2) }}
+                disabled={analyzing || mfdsLoading}
+                className="flex-1 py-4 rounded-2xl bg-slate-100 text-slate-600 font-bold flex items-center justify-center gap-2 disabled:opacity-40"
+              >
+                <RefreshCw size={18} /> 다시 촬영하기
+              </button>
+              {!analyzing && !mfdsLoading && pillResults.length > 0 && (
+                <button
+                  onClick={() => setShowCorrection(true)}
+                  className="py-4 px-4 rounded-2xl bg-amber-100 text-amber-700 font-bold flex items-center justify-center gap-1.5 text-sm"
+                >
+                  ✏️ 정정
+                </button>
+              )}
+            </div>
           ) : (
             <div className="flex gap-3">
               <button onClick={() => fileInputRef.current?.click()} className="flex-1 py-4 rounded-2xl bg-slate-100 text-slate-600 font-bold flex items-center justify-center gap-2">
@@ -1737,6 +1882,13 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
           <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileChange} />
         </div>
       )}
+      <CorrectionModal
+        isOpen={showCorrection}
+        onClose={() => setShowCorrection(false)}
+        currentImage={capturedImageBase64}
+        currentResult={selectedPill}
+        onSubmit={onCorrection}
+      />
     </div>
   )
 }
@@ -1762,6 +1914,7 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(!localStorage.getItem('igodae_onboarding_done'))
   const [logoTapCount, setLogoTapCount] = useState(0)
   const logoTapTimer = useRef(null)
+  const [capturedImageBase64, setCapturedImageBase64] = useState(null)
 
   useEffect(() => {
     if (!auth) { setAuthReady(true); return }
@@ -1800,6 +1953,21 @@ export default function App() {
     } catch (e) { console.warn('Firestore 저장 실패:', e.message) }
   }, [currentUser, userConditions])
 
+  const saveCorrection = useCallback(async ({ correctDrugName, originalResult, originalConfidence, image }) => {
+    if (!db || !currentUser) return
+    try {
+      await addDoc(CORRECTIONS_PATH(), {
+        userId: currentUser.uid,
+        correctDrugName,
+        originalResult,
+        originalConfidence,
+        imageBase64: image || null,
+        createdAt: serverTimestamp(),
+      })
+      console.log('✅ 정정 데이터 저장:', correctDrugName)
+    } catch (e) { console.warn('정정 저장 실패:', e.message) }
+  }, [currentUser])
+
   const processImage = useCallback((file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
@@ -1818,6 +1986,7 @@ export default function App() {
     setAnalysisResult(null)
     setPillResults([])
     setDurWarnings([])
+    setCapturedImageBase64(base64)
 
     let aiResult
     const imageDataUrl = `data:${mimeType};base64,${base64}`
@@ -1969,6 +2138,7 @@ export default function App() {
         onRetry={() => { setPreviewUrl(null); setAnalysisResult(null); setMfdsInfo(null); setPillResults([]); setCombinedAnalysis(null); setDurWarnings([]) }}
         previewUrl={previewUrl} logCount={analysisLogs.length}
         symptom={symptom} onSymptomChange={setSymptom} onLogoTap={handleLogoTap}
+        onCorrection={saveCorrection} capturedImageBase64={capturedImageBase64}
       />
       {showAdminPin && (
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center px-6">
