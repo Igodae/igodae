@@ -117,7 +117,7 @@ function modelDevProxy() {
 
         try {
           // health 체크는 GET
-          const subPath = req.url?.replace(/\?.*$/, '') || ''
+          const subPath = (req.url?.replace(/\?.*$/, '') || '').replace(/^\/+$/, '')
           const targetUrl = `http://localhost:5001/api/model-inference${subPath}`
 
           if (req.method === 'GET') {

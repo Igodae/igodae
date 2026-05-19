@@ -86,17 +86,20 @@ async function safeFetchGroq(body, retries = 3, delay = 1000) {
 // ─── DL 모델 추론 (결정적, 같은 사진 = 같은 결과) ────────────────────────────
 async function fetchModelInference(base64WithPrefix) {
   try {
+    console.log('🔬 DL 모델 호출 시작...')
     const res = await fetch(MODEL_PROXY, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ image: base64WithPrefix }),
     })
+    console.log(`🔬 DL 모델 응답: ${res.status}`)
     if (!res.ok) return null
     const data = await res.json()
+    console.log('🔬 DL 모델 결과:', JSON.stringify(data).slice(0, 200))
     if (data.error || !data.success) return null
     return data
-  } catch {
-    // 모델 서버 미실행 → null (Groq 폴백)
+  } catch (e) {
+    console.log('🔬 DL 모델 연결 실패:', e.message)
     return null
   }
 }
@@ -373,42 +376,58 @@ async function analyzePillsCombined(pillResults, symptom) {
 async function analyzeSinglePill(pillFeature, symptomHint) {
   let pillData = null
   let matchSource = 'none'
+  let drugInfo = null
+  let permitInfo = null
 
-  // 1단계: Vision이 약 이름 읽었으면 이름으로 먼저 검색
-  if (pillFeature.drugName && pillFeature.drugName.trim().length > 0) {
-    pillData = await fetchPillByName(pillFeature.drugName.trim())
-    if (pillData) matchSource = 'name'
+  // DL 모델이 약 이름을 줬으면 → 낱알식별 건너뛰고 바로 drugInfo/permission 조회
+  if (pillFeature.fromDL && pillFeature.drugName?.trim()) {
+    const dlName = pillFeature.drugName.trim()
+    ;[drugInfo, permitInfo] = await Promise.all([
+      fetchMfdsInfo(dlName),
+      fetchDrugPermission(dlName),
+    ])
+    if (drugInfo) {
+      matchSource = 'dl_name'
+      pillData = { itemName: drugInfo.itemName || dlName, entpName: drugInfo.entpName }
+    }
+  }
+
+  // DL 결과 없거나 drugInfo 못 찾으면 기존 로직
+  if (!pillData) {
+    // 1단계: Vision이 약 이름 읽었으면 이름으로 먼저 검색
+    if (pillFeature.drugName && pillFeature.drugName.trim().length > 0) {
+      pillData = await fetchPillByName(pillFeature.drugName.trim())
+      if (pillData) matchSource = 'name'
+      if (!pillData && pillFeature.imprint && pillFeature.imprint.trim().length > 0) {
+        pillData = await fetchPillByName(pillFeature.imprint.trim())
+        if (pillData) matchSource = 'imprint'
+      }
+    }
+
+    // 2단계: 각인 단독 검색
     if (!pillData && pillFeature.imprint && pillFeature.imprint.trim().length > 0) {
       pillData = await fetchPillByName(pillFeature.imprint.trim())
       if (pillData) matchSource = 'imprint'
     }
-  }
 
-  // 2단계: 각인 단독 검색
-  if (!pillData && pillFeature.imprint && pillFeature.imprint.trim().length > 0) {
-    pillData = await fetchPillByName(pillFeature.imprint.trim())
-    if (pillData) matchSource = 'imprint'
-  }
+    // 3단계: 색상/모양으로 fallback
+    if (!pillData) {
+      pillData = await fetchPillByFeature({
+        color: pillFeature.color,
+        shape: pillFeature.shape,
+        imprint: pillFeature.imprint,
+        form: pillFeature.form,
+      })
+      if (pillData) matchSource = 'feature'
+    }
 
-  // 3단계: 색상/모양으로 fallback
-  if (!pillData) {
-    pillData = await fetchPillByFeature({
-      color: pillFeature.color,
-      shape: pillFeature.shape,
-      imprint: pillFeature.imprint,
-      form: pillFeature.form,
-    })
-    if (pillData) matchSource = 'feature'
-  }
-
-  // 4단계: 약품명으로 개요 + 제품허가 병렬 조회
-  let drugInfo = null
-  let permitInfo = null
-  if (pillData?.itemName) {
-    ;[drugInfo, permitInfo] = await Promise.all([
-      fetchMfdsInfo(pillData.itemName),
-      fetchDrugPermission(pillData.itemName),
-    ])
+    // 4단계: 약품명으로 개요 + 제품허가 병렬 조회
+    if (pillData?.itemName && !drugInfo) {
+      ;[drugInfo, permitInfo] = await Promise.all([
+        fetchMfdsInfo(pillData.itemName),
+        fetchDrugPermission(pillData.itemName),
+      ])
+    }
   }
 
   if (pillData) {
@@ -1818,74 +1837,23 @@ export default function App() {
       return
     }
 
-    if (dlResult?.isPill && dlResult.pills?.length > 0 && dlResult.confidence >= 0.75) {
-      // DL 모델 높은 확신 → Groq 없이 바로 식약처 조회
-      console.log(`🧠 DL 모델 직행 (유사도: ${(dlResult.confidence * 100).toFixed(1)}%)`)
+    if (dlResult?.isPill && dlResult.pills?.length > 0) {
+      // DL 모델이 약으로 인식 → confidence 구간별 처리
+      const conf = dlResult.confidence
+      const confLabel = conf >= 0.75 ? '높음' : conf >= 0.45 ? '보통' : '낮음'
+      console.log(`🧠 DL 모델 매칭 (유사도: ${(conf * 100).toFixed(1)}%, 확신도: ${confLabel})`)
+      const topPill = dlResult.pills[0]
       aiResult = {
-        pills: dlResult.pills.map((p, i) => ({
-          drugName: p.drugName,
+        pills: [{
+          drugName: topPill.drugName,
           color: '', shape: '', form: '', imprint: '', size: '',
-          confidence: p.similarity,
-          description: `DL 모델 매칭 (유사도 ${(p.similarity * 100).toFixed(1)}%)`,
-        })),
-        totalCount: dlResult.pills.length,
+          confidence: topPill.similarity,
+          description: `DL 모델 매칭 (유사도 ${(topPill.similarity * 100).toFixed(1)}%, 확신도 ${confLabel})`,
+          fromDL: true,
+        }],
+        totalCount: 1,
         symptomHint: '',
-      }
-    } else if (dlResult?.isPill && dlResult.pills?.length > 0) {
-      // DL 모델 중간 확신 (0.45~0.75) → Groq로 교차검증
-      console.log(`🔀 DL+Groq 교차검증 (DL 유사도: ${(dlResult.confidence * 100).toFixed(1)}%)`)
-      try {
-        const data = await safeFetchGroq({
-          model: GROQ_VISION_MODEL,
-          messages: [{ role: 'user', content: [
-            { type: 'text', text: buildVisionPrompt(userConditions, symptom) },
-            { type: 'image_url', image_url: { url: imageDataUrl } }
-          ]}],
-          temperature: 0.1,
-          max_tokens: 1000,
-        })
-        const raw = data.choices?.[0]?.message?.content || '{}'
-        const groqResult = JSON.parse(raw.replace(/```json|```/g, '').trim())
-
-        // Groq 결과에 DL confidence 병합 (DL이 더 안정적이므로 DL 기준)
-        if (groqResult.pills?.length > 0) {
-          const dlTopName = dlResult.pills[0]?.drugName || ''
-          groqResult.pills.forEach(pill => {
-            // Groq 약 이름이 DL Top1과 일치하면 confidence 부스트
-            if (dlTopName && pill.drugName && pill.drugName.includes(dlTopName.slice(0, 4))) {
-              pill.confidence = Math.max(pill.confidence || 0, dlResult.confidence)
-            }
-            // DL confidence를 기본값으로 (Groq보다 안정적)
-            if (!pill.confidence || pill.confidence < dlResult.confidence) {
-              pill.confidence = dlResult.confidence
-            }
-          })
-          aiResult = groqResult
-        } else {
-          // Groq가 인식 못하면 DL 결과 사용
-          aiResult = {
-            pills: dlResult.pills.map(p => ({
-              drugName: p.drugName,
-              color: '', shape: '', form: '', imprint: '', size: '',
-              confidence: p.similarity,
-              description: `DL 모델 매칭 (유사도 ${(p.similarity * 100).toFixed(1)}%)`,
-            })),
-            totalCount: dlResult.pills.length,
-            symptomHint: '',
-          }
-        }
-      } catch {
-        // Groq 실패해도 DL 결과로 진행
-        aiResult = {
-          pills: dlResult.pills.map(p => ({
-            drugName: p.drugName,
-            color: '', shape: '', form: '', imprint: '', size: '',
-            confidence: p.similarity,
-            description: `DL 모델 매칭 (유사도 ${(p.similarity * 100).toFixed(1)}%)`,
-          })),
-          totalCount: dlResult.pills.length,
-          symptomHint: '',
-        }
+        dlConfidenceLevel: confLabel,
       }
     } else {
       // ── DL 모델 미연결 또는 실패 → 기존 Groq 단독 ──
