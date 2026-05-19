@@ -380,7 +380,7 @@ async function analyzeSinglePill(pillFeature, symptomHint) {
   let drugInfo = null
   let permitInfo = null
 
-  // DL 모델이 약 이름을 줬으면 → 낱알식별 건너뛰고 바로 drugInfo/permission 조회
+  // DL 모델이 약 이름을 줬으면 → drugInfo 먼저, 없으면 pillInfo 폴백
   if (pillFeature.fromDL && pillFeature.drugName?.trim()) {
     const dlName = pillFeature.drugName.trim()
     ;[drugInfo, permitInfo] = await Promise.all([
@@ -391,9 +391,23 @@ async function analyzeSinglePill(pillFeature, symptomHint) {
       matchSource = 'dl_name'
       pillData = { itemName: drugInfo.itemName || dlName, entpName: drugInfo.entpName }
     }
+    // drugInfo에 없으면 → pillInfo(낱알식별)로 폴백
+    if (!pillData) {
+      pillData = await fetchPillByName(dlName)
+      if (pillData) {
+        matchSource = 'dl_name'
+        // pillData에서 이름 찾았으면 drugInfo/permission 재시도
+        if (pillData.itemName) {
+          ;[drugInfo, permitInfo] = await Promise.all([
+            fetchMfdsInfo(pillData.itemName),
+            fetchDrugPermission(pillData.itemName),
+          ])
+        }
+      }
+    }
   }
 
-  // DL 결과 없거나 drugInfo 못 찾으면 기존 로직
+  // DL 결과 없거나 둘 다 못 찾으면 기존 로직
   if (!pillData) {
     // 1단계: Vision이 약 이름 읽었으면 이름으로 먼저 검색
     if (pillFeature.drugName && pillFeature.drugName.trim().length > 0) {
