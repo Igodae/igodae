@@ -667,6 +667,14 @@ const calculateMatchConfidence = ({ pillFeature, matchSource, drugInfo, permitIn
   return Math.max(50, Math.min(99, score)) / 100
 }
 
+function DisclaimerBar() {
+  return (
+    <p className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[480px] text-center text-[13px] text-slate-400 bg-white/80 backdrop-blur-sm py-2 z-40 leading-snug pointer-events-none">
+      AI 정보는 참고용입니다 · 전문의 판단이 우선합니다
+    </p>
+  )
+}
+
 function CommunityButton({ label = '약사 커뮤니티에 물어보기' }) {
   return (
     <a
@@ -1449,7 +1457,7 @@ function ChatView({ result, mfdsInfo, userConditions, onBack }) {
         </div>
       )}
 
-      <div className="px-4 pb-8 pt-2 border-t border-slate-100 bg-white">
+      <div className="px-4 pb-10 pt-2 border-t border-slate-100 bg-white">
         <div className="flex items-end gap-2 bg-slate-100 rounded-3xl px-4 py-2">
           <textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() } }}
@@ -1460,7 +1468,7 @@ function ChatView({ result, mfdsInfo, userConditions, onBack }) {
             <Send size={15} className="text-white" />
           </button>
         </div>
-        <p className="text-center text-xs text-slate-300 mt-2">AI 정보는 참고용입니다 · 전문의 판단이 우선합니다</p>
+        <DisclaimerBar />
       </div>
     </div>
   )
@@ -1482,6 +1490,7 @@ function HistoryView({ logs, onSelect, onBack }) {
           <p className="text-sm font-medium">아직 분석 기록이 없어요</p>
           <p className="text-xs text-center leading-relaxed">약품 사진을 촬영하면<br/>분석 결과가 여기에 저장됩니다.</p>
         </div>
+        <DisclaimerBar />
       </div>
     )
   }
@@ -1509,6 +1518,7 @@ function HistoryView({ logs, onSelect, onBack }) {
           )
         })}
       </div>
+      <DisclaimerBar />
     </div>
   )
 }
@@ -1564,6 +1574,7 @@ function AdminView({ logs, onBack }) {
           ))}
         </div>
       </div>
+      <DisclaimerBar />
     </div>
   )
 }
@@ -1903,6 +1914,7 @@ function HomeView({ userConditions, analysisResult, mfdsInfo, pillResults, combi
         currentResult={selectedPill}
         onSubmit={onCorrection}
       />
+      <DisclaimerBar />
     </div>
   )
 }
