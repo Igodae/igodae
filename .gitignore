@@ -1,3 +1,10 @@
-.env 
-node_modules/ 
-dist/ 
+.env
+node_modules/
+dist/
+ml/venv/
+ml/data/
+ml/output/
+pill-classifier/venv/
+pill-classifier/data/
+pill-classifier/output/
+.claude/
